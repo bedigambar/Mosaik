@@ -1,0 +1,1621 @@
+"use client";
+
+import { useRef, useEffect, useState, useCallback, useMemo } from "react";
+import {
+  Upload, Download, Code, RefreshCw,
+  ChevronDown, ChevronRight, Copy, Check,
+  Play, Pause, Film, ImageIcon, Type, Sun, Moon,
+  Columns2, Bookmark, FileVideo, X as XIcon, Plus, Info
+} from "lucide-react";
+import { ditherImage, drawDots, generateInteractionCode, generateReactCode, DEFAULT_PARAMS, DitherParams, DotCoord, BLEND_MODES, dotsToSVG } from "@/lib/mosaik";
+import { imageDataToAscii, renderAsciiToCanvas, generateAsciiVideoCode, DEFAULT_ASCII_PARAMS, AsciiParams, AsciiCell } from "@/lib/ascii";
+import { useWorkerMosaik } from "@/lib/useWorkerMosaik";
+import { extractVideoFrames } from "@/lib/videoFrames";
+import { decodeGif } from "@/lib/gifDecoder";
+import Slider from "./Slider";
+import Toggle from "./Toggle";
+import { PALETTES } from "@/lib/mosaik";
+
+const OUTPUT_SIZE = 600;
+const MAX_VIDEO_FRAMES = 90;
+
+type Tab = "studio" | "preview";
+type Mode = "image" | "video" | "ascii";
+type VideoRender = "dither" | "ascii";
+
+const ALGORITHMS = [
+  { value: "floyd-steinberg", label: "Floyd-Steinberg" },
+  { value: "atkinson", label: "Atkinson" },
+  { value: "ordered", label: "Ordered (Bayer)" },
+  { value: "threshold", label: "Hard Threshold" },
+] as const;
+
+const ASCII_CHARSET_OPTS = [
+  { value: "detailed", label: "@#S%?*+;:,." },
+  { value: "blocks", label: "█▓▒░" },
+  { value: "pixel", label: "Pixel Blocks" },
+  { value: "minimal", label: "@:. " },
+  { value: "braille", label: "⠿ Braille" },
+  { value: "custom", label: "Custom" },
+] as const;
+
+const PAINT_ONLY_DITHER = new Set<keyof DitherParams>(["bgColor", "dotColor", "repelRadius", "repelStrength"]);
+const PAINT_ONLY_ASCII = new Set<keyof AsciiParams>(["bgColor", "fgColor", "colored", "glow", "glowColor", "glowRadius"]);
+
+interface Preset {
+  id: string; name: string; mode: Mode;
+  params: DitherParams; asciiParams: AsciiParams;
+  builtIn?: boolean;
+}
+
+const BUILT_IN_PRESETS: Preset[] = [
+  {
+    id: "bi_halftone", name: "Halftone", mode: "image", builtIn: true,
+    params: { ...DEFAULT_PARAMS, algorithm: "floyd-steinberg", scale: 4, dotMinRadius: 0.5, dotMaxRadius: 3, bgColor: "#ffffff", dotColor: "#000000" },
+    asciiParams: DEFAULT_ASCII_PARAMS
+  },
+  {
+    id: "bi_blueprint", name: "Blueprint", mode: "image", builtIn: true,
+    params: { ...DEFAULT_PARAMS, algorithm: "ordered", scale: 5, bgColor: "#0a1e4a", dotColor: "#a0c8ff", contrast: 30 },
+    asciiParams: DEFAULT_ASCII_PARAMS
+  },
+  {
+    id: "bi_neon", name: "Neon Dots", mode: "image", builtIn: true,
+    params: { ...DEFAULT_PARAMS, useSourceColor: true, bgColor: "#000000", scale: 3, dotMinRadius: 0.8 },
+    asciiParams: DEFAULT_ASCII_PARAMS
+  },
+  {
+    id: "bi_ghost", name: "Ghost", mode: "image", builtIn: true,
+    params: { ...DEFAULT_PARAMS, threshold: 75, scale: 8, dotMaxRadius: 4, contrast: 45 },
+    asciiParams: DEFAULT_ASCII_PARAMS
+  },
+  {
+    id: "bi_ascii_neon", name: "ASCII Neon", mode: "ascii", builtIn: true,
+    params: DEFAULT_PARAMS,
+    asciiParams: { ...DEFAULT_ASCII_PARAMS, glow: true, glowColor: "var(--accent)", glowRadius: 8, colored: true, invertBrightness: true }
+  },
+];
+
+function computeDims(w: number, h: number) {
+  const asp = w / h;
+  let cw = OUTPUT_SIZE, ch = OUTPUT_SIZE;
+  if (asp > 1) ch = Math.round(OUTPUT_SIZE / asp);
+  else cw = Math.round(OUTPUT_SIZE * asp);
+  return { cw, ch };
+}
+
+function Section({ title, children, defaultOpen = true }: { title: string; children: React.ReactNode; defaultOpen?: boolean }) {
+  const [open, setOpen] = useState(defaultOpen);
+  return (
+    <div style={{ borderBottom: "1px solid var(--border)" }}>
+      <button onClick={() => setOpen(o => !o)}
+        style={{ display: "flex", alignItems: "center", gap: 6, width: "100%", padding: "8px 16px", background: "none", border: "none", cursor: "pointer", color: "var(--muted)" }}>
+        {open ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+        <span style={{ fontSize: 9, fontFamily: "'JetBrains Mono',monospace", letterSpacing: "0.1em", textTransform: "uppercase" }}>{title}</span>
+      </button>
+      {open && <div style={{ display: "flex", flexDirection: "column", gap: 10, padding: "2px 16px 14px" }}>{children}</div>}
+    </div>
+  );
+}
+
+function ColorRow({ label, value, onChange }: { label: string; value: string; onChange: (v: string) => void }) {
+  return (
+    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+      <span style={{ color: "var(--muted)", fontSize: 10, fontFamily: "'JetBrains Mono',monospace", letterSpacing: "0.06em" }}>{label}</span>
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <span style={{ color: "var(--text)", fontSize: 10, fontFamily: "'JetBrains Mono',monospace" }}>{value}</span>
+        <label style={{ position: "relative", width: 22, height: 22, borderRadius: 5, border: "1px solid var(--border)", overflow: "hidden", cursor: "pointer", flexShrink: 0, background: value }}>
+          <input type="color" value={value} onChange={e => onChange(e.target.value)}
+            style={{ position: "absolute", inset: 0, opacity: 0, width: "100%", height: "100%", cursor: "pointer", padding: 0 }} />
+        </label>
+      </div>
+    </div>
+  );
+}
+
+function SubToggle({ value, onChange }: { value: VideoRender; onChange: (v: VideoRender) => void }) {
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4, padding: "8px 16px 10px", borderBottom: "1px solid var(--border)" }}>
+      {(["dither", "ascii"] as VideoRender[]).map(v => (
+        <button key={v} onClick={() => onChange(v)}
+          className={`btn-chip${value === v ? " active" : ""}`}
+          style={{ padding: "6px 0", fontSize: 10, textTransform: "capitalize" }}>
+          {v === "dither" ? "Mosaik Dots" : "ASCII Text"}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+export default function MosaikStudio() {
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const studioCanvasRef = useRef<HTMLCanvasElement>(null);
+  const previewCanvasRef = useRef<HTMLCanvasElement>(null);
+  const imageRef = useRef<HTMLImageElement | null>(null);
+  const imageDataRef = useRef<ImageData | null>(null);
+
+  type PhysDot = DotCoord & { ox: number; oy: number; tx: number; ty: number; vx: number; vy: number };
+  const previewDotsRef = useRef<PhysDot[]>([]);
+  const mouseRef = useRef({ x: -9999, y: -9999 });
+  const rafRef = useRef<number>(0);
+
+  const ditherFramesRef = useRef<DotCoord[][]>([]);
+  const asciiFramesRef = useRef<AsciiCell[][]>([]);
+  const rawFramesRef = useRef<ImageData[]>([]);
+  const canvasSizeRef = useRef({ w: OUTPUT_SIZE, h: OUTPUT_SIZE });
+
+  const videoRafRef = useRef<number>(0);
+  const frameIdxRef = useRef(0);
+  const videoPlayingRef = useRef(false);
+  const lastFrameTimeRef = useRef(0);
+  const reprocessDebounceRef = useRef<NodeJS.Timeout | null>(null);
+  const isReprocessingRef = useRef(false);
+
+  const paramsRef = useRef<DitherParams>(DEFAULT_PARAMS);
+  const asciiParamsRef = useRef<AsciiParams>(DEFAULT_ASCII_PARAMS);
+
+  const [theme, setTheme] = useState<"dark" | "light">("dark");
+  const [tab, setTab] = useState<Tab>("studio");
+  const [mode, setMode] = useState<Mode>("image");
+  const [videoRender, setVideoRender] = useState<VideoRender>("dither");
+  const videoRenderRef = useRef<VideoRender>("dither");
+  const [params, setParams] = useState<DitherParams>(DEFAULT_PARAMS);
+  const [asciiParams, setAsciiParams] = useState<AsciiParams>(DEFAULT_ASCII_PARAMS);
+  const [dots, setDots] = useState<DotCoord[]>([]);
+  const [dotsRef] = useState(() => ({ current: [] as DotCoord[] }));
+  const [dotCount, setDotCount] = useState(0);
+  const [hasMedia, setHasMedia] = useState(false);
+  const [mediaName, setMediaName] = useState("");
+  const [rendering, setRendering] = useState(false);
+  const [dragging, setDragging] = useState(false);
+  const [copied, setCopied] = useState<"json" | "code" | "ascii" | "react" | null>(null);
+  const [showAbout, setShowAbout] = useState(false);
+  const [codeModal, setCodeModal] = useState<string | null>(null);
+  const [canvasSize, setCanvasSize] = useState({ w: OUTPUT_SIZE, h: OUTPUT_SIZE });
+  const [videoPlaying, setVideoPlaying] = useState(false);
+  const [videoProgress, setVideoProgress] = useState(0);
+  const [isExtracting, setIsExtracting] = useState(false);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [videoFrameCount, setVideoFrameCount] = useState(0);
+  const [videoCurrentFrame, setVideoCurFrame] = useState(0);
+  const { runMosaik, terminate: terminateMosaik } = useWorkerMosaik();
+  const [videoFps, setVideoFps] = useState(24);
+  const [progressLabel, setProgressLabel] = useState("");
+  const [userPresets, setUserPresets] = useState<Preset[]>([]);
+  const [showCompare, setShowCompare] = useState(false);
+  const [splitRatio, setSplitRatio] = useState(0.5);
+  const [exportingWebM, setExportingWebM] = useState(false);
+  const [exportingGIF, setExportingGIF] = useState(false);
+  const [showSavePreset, setShowSavePreset] = useState(false);
+  const [glyphImage, setGlyphImage] = useState<HTMLImageElement | null>(null);
+
+  const compareCanvasRef = useRef<HTMLCanvasElement>(null);
+  const isDraggingSplitRef = useRef(false);
+  const presetNameRef = useRef<HTMLInputElement>(null);
+  type Effect = "repel" | "attract" | "wave" | "noise" | "vortex" | "breathe";
+  const [effect, setEffect] = useState<Effect>("repel");
+  const effectRef = useRef<Effect>("repel");
+  useEffect(() => { effectRef.current = effect; }, [effect]);
+
+  const isVideo = mode === "video";
+  const isAscii = mode === "ascii" || (isVideo && videoRender === "ascii");
+  const showDots = mode === "image" || (isVideo && videoRender === "dither");
+  const canBg = isAscii ? asciiParams.bgColor : (hasMedia ? params.bgColor : "var(--bg)");
+  const isLoading = isExtracting || isProcessing;
+
+  useEffect(() => { document.documentElement.setAttribute("data-theme", theme); }, [theme]);
+
+  // Keep videoRenderRef in sync
+  useEffect(() => { videoRenderRef.current = videoRender; }, [videoRender]);
+
+  const currentModeHasMedia = isVideo ? (videoFrameCount > 0) : (!!imageRef.current);
+
+
+  // Load user presets from localStorage on mount
+  useEffect(() => {
+    try { setUserPresets(JSON.parse(localStorage.getItem("mosaik-presets") || "[]")); } catch { /* empty */ }
+  }, []);
+
+  // Handle custom glyph image loading
+  useEffect(() => {
+    if (params.customGlyph) {
+      const img = new Image();
+      img.onload = () => setGlyphImage(img);
+      img.src = params.customGlyph;
+    } else {
+      setGlyphImage(null);
+    }
+  }, [params.customGlyph]);
+
+  const setParam = useCallback(<K extends keyof DitherParams>(k: K, v: DitherParams[K]) => {
+    setParams(p => { const n = { ...p, [k]: v }; paramsRef.current = n; return n; });
+  }, []);
+  const setAsciiParam = useCallback(<K extends keyof AsciiParams>(k: K, v: AsciiParams[K]) => {
+    setAsciiParams(p => { const n = { ...p, [k]: v }; asciiParamsRef.current = n; return n; });
+  }, []);
+  void setParam; void setAsciiParam;
+
+  const repaintDither = useCallback((frameDots: DotCoord[], p: DitherParams) => {
+    const canvas = studioCanvasRef.current; if (!canvas) return;
+    const ctx = canvas.getContext("2d")!;
+    drawDots(ctx, frameDots, p, canvas.width, canvas.height, glyphImage);
+  }, [glyphImage]);
+
+  const repaintAscii = useCallback((cells: AsciiCell[], ap: AsciiParams) => {
+    const canvas = studioCanvasRef.current; if (!canvas) return;
+    const { w, h } = canvasSizeRef.current;
+    renderAsciiToCanvas(canvas, cells, ap, w, h);
+  }, []);
+
+  const renderImageDither = useCallback(async (img: HTMLImageElement, p: DitherParams) => {
+    terminateMosaik(); // Terminate any previous worker
+    setRendering(true);
+    const { cw, ch } = computeDims(img.width, img.height);
+    const canvas = studioCanvasRef.current!;
+    canvas.width = cw; canvas.height = ch;
+    canvasSizeRef.current = { w: cw, h: ch }; setCanvasSize({ w: cw, h: ch });
+
+    const off = document.createElement("canvas");
+    off.width = img.width; off.height = img.height;
+    off.getContext("2d")!.drawImage(img, 0, 0);
+    const imageData = off.getContext("2d")!.getImageData(0, 0, img.width, img.height);
+    imageDataRef.current = imageData;
+
+    const { dots: newDots } = await runMosaik(imageData, p, cw, ch, -1);
+
+    dotsRef.current = newDots;
+    setDots(newDots); setDotCount(newDots.length);
+    repaintDither(newDots, p);
+    setRendering(false);
+  }, [repaintDither, dotsRef, runMosaik, terminateMosaik]);
+
+  const renderImageAscii = useCallback((img: HTMLImageElement, ap: AsciiParams) => {
+    setRendering(true);
+    const { cw, ch } = computeDims(img.width, img.height);
+    const canvas = studioCanvasRef.current!;
+    canvas.width = cw; canvas.height = ch;
+    canvasSizeRef.current = { w: cw, h: ch }; setCanvasSize({ w: cw, h: ch });
+    const off = document.createElement("canvas");
+    off.width = img.width; off.height = img.height;
+    off.getContext("2d")!.drawImage(img, 0, 0);
+    const imageData = off.getContext("2d")!.getImageData(0, 0, img.width, img.height);
+    const cells = imageDataToAscii(imageData, ap, cw, ch);
+    renderAsciiToCanvas(canvas, cells, ap, cw, ch);
+    setRendering(false);
+  }, []);
+
+  const pendingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const hasMediaRef = useRef(false);
+  const isVideoRef = useRef(false);
+  const modeRef = useRef<Mode>("image");
+
+  useEffect(() => { hasMediaRef.current = hasMedia; }, [hasMedia]);
+  useEffect(() => { isVideoRef.current = isVideo; }, [isVideo]);
+  useEffect(() => { modeRef.current = mode; }, [mode]);
+
+  /* ── Re-dither all raw frames (for structural param changes in video mode) ── */
+  const reprocessDitherFrames = useCallback(async (p: DitherParams) => {
+    if (reprocessDebounceRef.current) clearTimeout(reprocessDebounceRef.current);
+    reprocessDebounceRef.current = setTimeout(async () => {
+      if (isReprocessingRef.current) return;
+      isReprocessingRef.current = true;
+      const frames = rawFramesRef.current;
+      if (!frames.length) { isReprocessingRef.current = false; return; }
+      const { w: width, h: height } = canvasSizeRef.current;
+      const dFrames: DotCoord[][] = [];
+      terminateMosaik(); // Terminate any previous worker
+      setIsProcessing(true);
+      for (let i = 0; i < frames.length; i++) {
+        setProgressLabel(`Processing Mosaik ${i + 1}/${frames.length}`);
+        setVideoProgress(i / frames.length);
+        const { dots: d } = await runMosaik(frames[i], p, width, height, i);
+        dFrames.push(d);
+        if (i % 5 === 0) await new Promise(r => setTimeout(r, 0));
+      }
+      ditherFramesRef.current = dFrames;
+      dotsRef.current = dFrames[0] ?? [];
+      setDots(dFrames[0] ?? []); setDotCount((dFrames[0] ?? []).length);
+      const idx = frameIdxRef.current;
+      const f = dFrames[idx] ?? dFrames[0];
+      if (f) repaintDither(f, p);
+      setIsProcessing(false);
+      isReprocessingRef.current = false;
+    }, 150);
+  }, [repaintDither, dotsRef, runMosaik, terminateMosaik]);
+
+  /* ── Re-ascii all raw frames (for structural param changes in video+ASCII mode) ── */
+  const reprocessAsciiFrames = useCallback(async (ap: AsciiParams) => {
+    if (reprocessDebounceRef.current) clearTimeout(reprocessDebounceRef.current);
+    reprocessDebounceRef.current = setTimeout(async () => {
+      const frames = rawFramesRef.current;
+      if (!frames.length) return;
+      const { w: width, h: height } = canvasSizeRef.current;
+      const aFrames: AsciiCell[][] = [];
+      setIsProcessing(true);
+      for (let i = 0; i < frames.length; i++) {
+        setProgressLabel(`ASCII ${i + 1}/${frames.length}`);
+        setVideoProgress(i / frames.length);
+        aFrames.push(imageDataToAscii(frames[i], ap, width, height));
+        if (i % 8 === 0) await new Promise(r => setTimeout(r, 0));
+      }
+      asciiFramesRef.current = aFrames;
+      const idx = frameIdxRef.current;
+      repaintAscii(aFrames[idx] ?? aFrames[0], ap);
+      setIsProcessing(false);
+    }, 100);
+  }, [repaintAscii]);
+
+  const resetParams = useCallback(() => {
+    const p = DEFAULT_PARAMS;
+    const ap = DEFAULT_ASCII_PARAMS;
+    setParams(p); setAsciiParams(ap);
+    paramsRef.current = p; asciiParamsRef.current = ap;
+    if (!hasMedia) return;
+    if (isVideo) {
+      if (videoRender === "dither") reprocessDitherFrames(p);
+      else reprocessAsciiFrames(ap);
+    } else {
+      if (mode === "ascii") renderImageAscii(imageRef.current!, ap);
+      else renderImageDither(imageRef.current!, p);
+    }
+  }, [hasMedia, isVideo, videoRender, mode, reprocessDitherFrames, reprocessAsciiFrames, renderImageAscii, renderImageDither]);
+
+  const triggerRender = useCallback((p: DitherParams, prev: DitherParams) => {
+    if (!hasMediaRef.current || isVideoRef.current || modeRef.current !== "image" || !imageRef.current) return;
+    const changed = (Object.keys(p) as (keyof DitherParams)[]).filter(k => p[k] !== prev[k]);
+    if (changed.length === 0) return;
+    const onlyPaint = changed.every(k => PAINT_ONLY_DITHER.has(k));
+    if (onlyPaint && dotsRef.current.length > 0) {
+      repaintDither(dotsRef.current, p);
+    } else {
+      if (pendingTimerRef.current) clearTimeout(pendingTimerRef.current);
+      pendingTimerRef.current = setTimeout(() => {
+        renderImageDither(imageRef.current!, paramsRef.current);
+      }, 80);
+    }
+  }, [repaintDither, renderImageDither, dotsRef]);
+
+  const triggerAsciiRender = useCallback((ap: AsciiParams, prev: AsciiParams) => {
+    if (!hasMediaRef.current || isVideoRef.current || modeRef.current !== "ascii" || !imageRef.current) return;
+    const changed = (Object.keys(ap) as (keyof AsciiParams)[]).filter(k => ap[k] !== prev[k]);
+    if (changed.length === 0) return;
+    const onlyPaint = changed.every(k => PAINT_ONLY_ASCII.has(k));
+    if (onlyPaint) {
+      if (pendingTimerRef.current) clearTimeout(pendingTimerRef.current);
+      renderImageAscii(imageRef.current!, ap);
+    } else {
+      if (pendingTimerRef.current) clearTimeout(pendingTimerRef.current);
+      pendingTimerRef.current = setTimeout(() => {
+        renderImageAscii(imageRef.current!, asciiParamsRef.current);
+      }, 80);
+    }
+  }, [renderImageAscii]);
+
+  const prevParamsRef = useRef<DitherParams>(DEFAULT_PARAMS);
+  const prevAsciiParamsRef = useRef<AsciiParams>(DEFAULT_ASCII_PARAMS);
+
+  const setParamLive = useCallback(<K extends keyof DitherParams>(k: K, v: DitherParams[K]) => {
+    setParams(p => {
+      const n = { ...p, [k]: v };
+      paramsRef.current = n;
+      if (isVideoRef.current && hasMediaRef.current) {
+        // Video mode: repaint or reprocess
+        const changed = (Object.keys(n) as (keyof DitherParams)[]).filter(key => n[key] !== p[key]);
+        if (changed.every(key => PAINT_ONLY_DITHER.has(key))) {
+          const idx = frameIdxRef.current;
+          const f = ditherFramesRef.current[idx];
+          if (f) repaintDither(f, n);
+        } else {
+          reprocessDitherFrames(n);
+        }
+      } else {
+        triggerRender(n, prevParamsRef.current);
+      }
+      prevParamsRef.current = n;
+      return n;
+    });
+  }, [triggerRender, repaintDither, reprocessDitherFrames]);
+
+  const setAsciiParamLive = useCallback(<K extends keyof AsciiParams>(k: K, v: AsciiParams[K]) => {
+    setAsciiParams(p => {
+      const n = { ...p, [k]: v };
+      asciiParamsRef.current = n;
+      if (isVideoRef.current && hasMediaRef.current && videoRenderRef.current === "ascii") {
+        // Video+ASCII mode: repaint or reprocess
+        const changed = (Object.keys(n) as (keyof AsciiParams)[]).filter(key => n[key] !== p[key]);
+        if (changed.every(key => PAINT_ONLY_ASCII.has(key))) {
+          const idx = frameIdxRef.current;
+          const f = asciiFramesRef.current[idx];
+          if (f) repaintAscii(f, n);
+        } else {
+          reprocessAsciiFrames(n);
+        }
+      } else {
+        triggerAsciiRender(n, prevAsciiParamsRef.current);
+      }
+      prevAsciiParamsRef.current = n;
+      return n;
+    });
+  }, [triggerAsciiRender, repaintAscii, reprocessAsciiFrames]);
+
+  useEffect(() => {
+    if (!hasMedia || !isVideo || videoPlaying) return;
+    const idx = frameIdxRef.current;
+    if (videoRender === "dither") { const f = ditherFramesRef.current[idx]; if (f) repaintDither(f, params); }
+    else { const f = asciiFramesRef.current[idx]; if (f) repaintAscii(f, asciiParams); }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [videoRender, params.bgColor, params.dotColor, asciiParams.bgColor, asciiParams.fgColor, asciiParams.colored, asciiParams.glow, asciiParams.glowColor, asciiParams.glowRadius]);
+
+  const sourceColorProcessing = useRef(false);
+  useEffect(() => {
+    if (!hasMedia || !isVideo || !rawFramesRef.current.length) return;
+    if (sourceColorProcessing.current) return;
+    sourceColorProcessing.current = true;
+    const frames = rawFramesRef.current;
+    const { w: width, h: height } = canvasSizeRef.current;
+    const p = paramsRef.current;
+    setIsProcessing(true);
+    setProgressLabel("Re-processing source colors…");
+    (async () => {
+      const dFrames: DotCoord[][] = [];
+      terminateMosaik(); // Terminate any previous worker
+      for (let i = 0; i < frames.length; i++) {
+        const { dots: d } = await runMosaik(frames[i], p, width, height, i);
+        dFrames.push(d);
+        if (i % 5 === 0) await new Promise(r => setTimeout(r, 0));
+      }
+      ditherFramesRef.current = dFrames;
+      dotsRef.current = dFrames[0] ?? [];
+      setDots(dFrames[0] ?? []); setDotCount((dFrames[0] ?? []).length);
+      const idx = frameIdxRef.current;
+      const f = dFrames[idx] ?? dFrames[0];
+      if (f) repaintDither(f, paramsRef.current);
+      setIsProcessing(false);
+      sourceColorProcessing.current = false;
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [params.useSourceColor]);
+
+  const loadImage = useCallback((file: File) => {
+    setMode("image"); setMediaName(file.name);
+    const img = new Image();
+    img.onload = () => {
+      imageRef.current = img;
+      // Clear Video state
+      rawFramesRef.current = []; ditherFramesRef.current = []; asciiFramesRef.current = [];
+      setVideoFrameCount(0); setVideoCurFrame(0); frameIdxRef.current = 0;
+      setHasMedia(true);
+      renderImageDither(img, paramsRef.current);
+    };
+    img.src = URL.createObjectURL(file);
+  }, [renderImageDither]);
+
+  const loadAsciiImage = useCallback((file: File) => {
+    setMode("ascii"); setMediaName(file.name);
+    const img = new Image();
+    img.onload = () => {
+      imageRef.current = img;
+      // Clear Video state
+      rawFramesRef.current = []; ditherFramesRef.current = []; asciiFramesRef.current = [];
+      setVideoFrameCount(0); setVideoCurFrame(0); frameIdxRef.current = 0;
+      setHasMedia(true);
+      renderImageAscii(img, asciiParamsRef.current);
+    };
+    img.src = URL.createObjectURL(file);
+  }, [renderImageAscii]);
+
+  const loadVideo = useCallback(async (file: File) => {
+    setMode("video"); setMediaName(file.name);
+    setHasMedia(false); setIsExtracting(true);
+    setVideoProgress(0); setProgressLabel("Reading video…");
+    // Clear Image state
+    imageRef.current = null; imageDataRef.current = null;
+    ditherFramesRef.current = []; asciiFramesRef.current = []; rawFramesRef.current = [];
+    frameIdxRef.current = 0; setVideoCurFrame(0);
+    setVideoPlaying(false); videoPlayingRef.current = false;
+    try {
+      const { frames: rawFrames, width, height } = await extractVideoFrames(
+        file, videoFps, OUTPUT_SIZE, MAX_VIDEO_FRAMES,
+        (ratio: number, label: string) => { setVideoProgress(ratio * 0.35); setProgressLabel(label); }
+      );
+      rawFramesRef.current = rawFrames;
+      const canvas = studioCanvasRef.current!;
+      canvas.width = width; canvas.height = height;
+      canvasSizeRef.current = { w: width, h: height }; setCanvasSize({ w: width, h: height });
+      setIsExtracting(false); setIsProcessing(true);
+
+      const p = paramsRef.current;
+      const ap = asciiParamsRef.current;
+
+      const dFrames: DotCoord[][] = [];
+      terminateMosaik(); // Terminate any previous worker
+      for (let i = 0; i < rawFrames.length; i++) {
+        setProgressLabel(`Processing Mosaik ${i + 1}/${rawFrames.length}`);
+        setVideoProgress(0.35 + (i / rawFrames.length) * 0.35);
+        const { dots: d } = await runMosaik(rawFrames[i], p, width, height, i);
+        dFrames.push(d);
+        if (i % 5 === 0) await new Promise(r => setTimeout(r, 0));
+      }
+      ditherFramesRef.current = dFrames;
+
+      const aFrames: AsciiCell[][] = [];
+      for (let i = 0; i < rawFrames.length; i++) {
+        setProgressLabel(`ASCII ${i + 1}/${rawFrames.length}`);
+        setVideoProgress(0.70 + (i / rawFrames.length) * 0.30);
+        aFrames.push(imageDataToAscii(rawFrames[i], ap, width, height));
+        if (i % 5 === 0) await new Promise(r => setTimeout(r, 0));
+      }
+      asciiFramesRef.current = aFrames;
+
+      setVideoFrameCount(rawFrames.length);
+      dotsRef.current = dFrames[0] ?? [];
+      setDots(dFrames[0] ?? []); setDotCount((dFrames[0] ?? []).length);
+      const vr = videoRender;
+      if (vr === "dither") repaintDither(dFrames[0] ?? [], p);
+      else repaintAscii(aFrames[0] ?? [], ap);
+      setHasMedia(true); setIsProcessing(false);
+    } catch (e) {
+      console.error("Video error:", e);
+      setIsExtracting(false); setIsProcessing(false);
+      setProgressLabel("Error — " + (e as Error).message);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [videoFps, videoRender, repaintDither, repaintAscii, dotsRef, runMosaik, terminateMosaik]);
+
+  /* Load GIF: decode all frames -> same pipeline as video */
+  const loadGif = useCallback(async (file: File) => {
+    setMode("video"); setMediaName(file.name);
+    setHasMedia(false); setIsExtracting(true);
+    setVideoProgress(0); setProgressLabel("Decoding GIF…");
+    // Clear Image state
+    imageRef.current = null; imageDataRef.current = null;
+    ditherFramesRef.current = []; asciiFramesRef.current = []; rawFramesRef.current = [];
+    frameIdxRef.current = 0; setVideoCurFrame(0);
+    setVideoPlaying(false); videoPlayingRef.current = false;
+    try {
+      const { frames: rawFrames, fps: gifFps, width, height } = await decodeGif(
+        file,
+        (ratio: number, label: string) => { setVideoProgress(ratio * 0.35); setProgressLabel(label); }
+      );
+      rawFramesRef.current = rawFrames;
+      const canvas = studioCanvasRef.current!;
+      canvas.width = width; canvas.height = height;
+      canvasSizeRef.current = { w: width, h: height }; setCanvasSize({ w: width, h: height });
+      setVideoFps(gifFps);
+      setIsExtracting(false); setIsProcessing(true);
+      const p = paramsRef.current; const ap = asciiParamsRef.current;
+      const dFrames: DotCoord[][] = [];
+      terminateMosaik(); // Terminate any previous worker
+      for (let i = 0; i < rawFrames.length; i++) {
+        setProgressLabel(`Processing Mosaik ${i + 1}/${rawFrames.length}`); setVideoProgress(0.35 + (i / rawFrames.length) * 0.35);
+        const { dots: d } = await runMosaik(rawFrames[i], p, width, height, i);
+        dFrames.push(d);
+        if (i % 5 === 0) await new Promise(r => setTimeout(r, 0));
+      }
+      ditherFramesRef.current = dFrames;
+      const aFrames: AsciiCell[][] = [];
+      for (let i = 0; i < rawFrames.length; i++) {
+        setProgressLabel(`ASCII ${i + 1}/${rawFrames.length}`); setVideoProgress(0.70 + (i / rawFrames.length) * 0.30);
+        aFrames.push(imageDataToAscii(rawFrames[i], ap, width, height));
+        if (i % 5 === 0) await new Promise(r => setTimeout(r, 0));
+      }
+      asciiFramesRef.current = aFrames;
+      setVideoFrameCount(rawFrames.length);
+      dotsRef.current = dFrames[0] ?? [];
+      setDots(dFrames[0] ?? []); setDotCount((dFrames[0] ?? []).length);
+      repaintDither(dFrames[0] ?? [], p);
+      setHasMedia(true); setIsProcessing(false);
+    } catch (e) {
+      console.error("GIF error:", e);
+      setIsExtracting(false); setIsProcessing(false);
+      setProgressLabel("Error — " + (e as Error).message);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [repaintDither, dotsRef]);
+
+  const handleFile = useCallback((file: File) => {
+    const t = file.type;
+    if (t === "image/gif") {
+      loadGif(file); // always decode all frames for GIFs
+    } else if (t.startsWith("video/")) {
+      loadVideo(file);
+    } else if (t.startsWith("image/")) {
+      modeRef.current === "ascii" ? loadAsciiImage(file) : loadImage(file);
+    }
+  }, [loadImage, loadAsciiImage, loadVideo, loadGif]);
+
+  // FIX: Repaint when the canvas element is swapped (Compare mode toggle)
+  useEffect(() => {
+    if (!hasMedia || (isVideo && videoPlaying)) return;
+    const canvas = studioCanvasRef.current;
+    if (canvas) {
+      canvas.width = canvasSizeRef.current.w;
+      canvas.height = canvasSizeRef.current.h;
+    }
+    const idx = frameIdxRef.current;
+    if (isAscii) {
+      if (isVideo) {
+        const f = asciiFramesRef.current[idx];
+        if (f) repaintAscii(f, asciiParamsRef.current);
+      } else if (imageRef.current) {
+        renderImageAscii(imageRef.current, asciiParamsRef.current);
+      }
+    } else {
+      if (isVideo) {
+        const f = ditherFramesRef.current[idx];
+        if (f) repaintDither(f, paramsRef.current);
+      } else {
+        const f = dotsRef.current;
+        if (f.length > 0) repaintDither(f, paramsRef.current);
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showCompare, tab, hasMedia, isVideo, isAscii, videoRender]);
+
+  const handleDrop = useCallback((e: React.DragEvent) => {
+    e.preventDefault(); const f = e.dataTransfer.files[0]; if (f) handleFile(f);
+  }, [handleFile]);
+
+  /* ── Video playback loop ── */
+  useEffect(() => {
+    if (!isVideo || !hasMedia) return;
+    if (!videoPlaying) {
+      const idx = frameIdxRef.current;
+      if (videoRender === "dither") { const f = ditherFramesRef.current[idx]; if (f) repaintDither(f, paramsRef.current); }
+      else { const f = asciiFramesRef.current[idx]; if (f) repaintAscii(f, asciiParamsRef.current); }
+      return;
+    }
+    const interval = 1000 / videoFps;
+    const loop = (time: number) => {
+      if (!videoPlayingRef.current) return;
+      if (time - lastFrameTimeRef.current >= interval) {
+        lastFrameTimeRef.current = time;
+        const total = videoRender === "dither" ? ditherFramesRef.current.length : asciiFramesRef.current.length;
+        if (!total) return;
+        frameIdxRef.current = (frameIdxRef.current + 1) % total;
+        setVideoCurFrame(frameIdxRef.current);
+        if (videoRender === "dither") { const f = ditherFramesRef.current[frameIdxRef.current]; if (f) repaintDither(f, paramsRef.current); }
+        else { const f = asciiFramesRef.current[frameIdxRef.current]; if (f) repaintAscii(f, asciiParamsRef.current); }
+      }
+      videoRafRef.current = requestAnimationFrame(loop);
+    };
+    videoRafRef.current = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(videoRafRef.current);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [videoPlaying, videoRender, hasMedia, videoFps]);
+
+  /* ── Preview: spring physics with swappable effects ── */
+  useEffect(() => {
+    if (tab !== "preview" || !currentModeHasMedia || (isAscii || (isVideo && videoRender === "ascii"))) return;
+    const canvas = previewCanvasRef.current; if (!canvas) return;
+    const { w, h } = canvasSizeRef.current;
+    canvas.width = w; canvas.height = h;
+    const ctx = canvas.getContext("2d")!;
+    const SPRING = 0.12, DAMPING = 0.78;
+    const interval = 1000 / videoFps;
+    let fidx = 0, lastFrameT = 0, prevTime = 0, t = 0;
+    const initDots = isVideo ? (ditherFramesRef.current[0] ?? []) : dotsRef.current;
+    previewDotsRef.current = initDots.map(d => ({ ...d, ox: d.x, oy: d.y, tx: d.x, ty: d.y, vx: 0, vy: 0 }));
+    // Simple deterministic noise helper
+    const noise2 = (x: number, y: number) => {
+      const n = Math.sin(x * 127.1 + y * 311.7) * 43758.5453;
+      return n - Math.floor(n);
+    };
+    const loop = (time: number) => {
+      const dt = Math.min((time - prevTime) / 16.67, 2); prevTime = time; t += 0.016 * dt;
+      const mouse = mouseRef.current; const p = paramsRef.current;
+      const eff = effectRef.current;
+      // Advance video frame
+      if (isVideo && ditherFramesRef.current.length > 1 && time - lastFrameT >= interval) {
+        lastFrameT = time; fidx = (fidx + 1) % ditherFramesRef.current.length;
+        const next = ditherFramesRef.current[fidx]; const prev = previewDotsRef.current;
+        const len = Math.min(prev.length, next.length);
+        for (let i = 0; i < len; i++) {
+          prev[i].tx = next[i].x; prev[i].ty = next[i].y; prev[i].r = next[i].r;
+          if (next[i].cr !== undefined) { prev[i].cr = next[i].cr; prev[i].cg = next[i].cg; prev[i].cb = next[i].cb; }
+        }
+        if (next.length > prev.length)
+          for (let i = prev.length; i < next.length; i++)
+            prev.push({ ...next[i], ox: next[i].x, oy: next[i].y, tx: next[i].x, ty: next[i].y, vx: 0, vy: 0 });
+        previewDotsRef.current = prev.slice(0, next.length);
+      }
+      for (const d of previewDotsRef.current) {
+        // Spring toward target (video frame morphing)
+        d.ox += (d.tx - d.ox) * 0.18 * dt; d.oy += (d.ty - d.oy) * 0.18 * dt;
+        const sx = (d.ox - d.x) * SPRING * dt, sy = (d.oy - d.y) * SPRING * dt;
+        let fx = sx, fy = sy;
+        const dx = d.x - mouse.x, dy = d.y - mouse.y;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        if (eff === "repel") {
+          if (dist < p.repelRadius && dist > 0.5) {
+            const tt = 1 - dist / p.repelRadius, force = tt * tt * tt * p.repelStrength;
+            fx += (dx / dist) * force * dt; fy += (dy / dist) * force * dt;
+          }
+        } else if (eff === "attract") {
+          if (dist < p.repelRadius && dist > 0.5) {
+            const tt = 1 - dist / p.repelRadius, force = tt * tt * tt * p.repelStrength;
+            fx -= (dx / dist) * force * dt; fy -= (dy / dist) * force * dt;
+          }
+        } else if (eff === "wave") {
+          const amp = p.repelStrength * 0.4;
+          const lambda = Math.max(w, h) * 0.15;
+          d.x = d.ox + Math.sin(d.oy / lambda + t * 2.5) * amp;
+          d.y = d.oy + Math.sin(d.ox / lambda + t * 2.5 + Math.PI * 0.5) * amp;
+          d.vx = 0; d.vy = 0; continue;
+        } else if (eff === "noise") {
+          const scale = 0.008, speed = 1.2;
+          const angle = noise2(d.ox * scale + t * speed, d.oy * scale) * Math.PI * 4;
+          const force = p.repelStrength * 0.08 * dt;
+          fx += Math.cos(angle) * force; fy += Math.sin(angle) * force;
+        } else if (eff === "vortex") {
+          if (dist < p.repelRadius && dist > 0.5) {
+            const tt = 1 - dist / p.repelRadius, force = tt * tt * p.repelStrength * 0.6 * dt;
+            // Tangential: perpendicular to (dx, dy)
+            fx += (-dy / dist) * force; fy += (dx / dist) * force;
+          }
+        } else if (eff === "breathe") {
+          const amp = p.repelStrength * 0.35;
+          const phase = t * 1.8;
+          d.x = d.ox + Math.sin(phase + d.oy * 0.012) * amp;
+          d.y = d.oy + Math.cos(phase + d.ox * 0.012) * amp;
+          d.vx = 0; d.vy = 0; continue;
+        }
+        d.vx = (d.vx + fx) * Math.pow(DAMPING, dt); d.vy = (d.vy + fy) * Math.pow(DAMPING, dt);
+        d.x += d.vx; d.y += d.vy;
+      }
+      drawDots(ctx, previewDotsRef.current, p, w, h, glyphImage);
+      rafRef.current = requestAnimationFrame(loop);
+    };
+    rafRef.current = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(rafRef.current);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab, mode, videoRender, currentModeHasMedia, canvasSize, glyphImage]);
+
+  /* ── Preview: ASCII with canvas-transform effects ── */
+  useEffect(() => {
+    const previewIsAscii = isAscii || (isVideo && videoRender === "ascii");
+    if (tab !== "preview" || !currentModeHasMedia || !previewIsAscii) return;
+    const canvas = previewCanvasRef.current; if (!canvas) return;
+    const { w, h } = canvasSizeRef.current; canvas.width = w; canvas.height = h;
+    const ap = asciiParamsRef.current; const interval = 1000 / videoFps;
+    let fidx = 0, lastT = 0, t = 0, prevTime = 0;
+    if (mode === "ascii" && imageRef.current) renderImageAscii(imageRef.current, ap);
+    else { const f = asciiFramesRef.current[0]; if (f) renderAsciiToCanvas(canvas, f, ap, w, h); }
+    const loop = (time: number) => {
+      const dt = Math.min((time - prevTime) / 16.67, 2); prevTime = time; t += 0.016 * dt;
+      if (isVideo && asciiFramesRef.current.length > 1 && time - lastT >= interval) {
+        lastT = time; fidx = (fidx + 1) % asciiFramesRef.current.length;
+        const f = asciiFramesRef.current[fidx]; if (f) renderAsciiToCanvas(canvas, f, asciiParamsRef.current, w, h);
+      }
+      // Apply canvas-level transform based on effect
+      const eff = effectRef.current;
+      const mouse = mouseRef.current;
+      const amp = 6;
+      if (eff === "wave") {
+        canvas.style.transform = `translate(${Math.sin(t * 2.5) * amp}px, ${Math.cos(t * 1.8) * amp * 0.6}px)`;
+      } else if (eff === "breathe") {
+        const s = 1 + Math.sin(t * 1.8) * 0.015;
+        canvas.style.transform = `scale(${s})`;
+      } else if (eff === "noise") {
+        const nx = Math.sin(t * 7.3) * amp * 0.5, ny = Math.cos(t * 5.7) * amp * 0.5;
+        canvas.style.transform = `translate(${nx}px,${ny}px)`;
+      } else if (eff === "vortex" || eff === "repel" || eff === "attract") {
+        // Subtle cursor-reactive canvas tilt
+        const cx = w / 2, cy = h / 2;
+        const dx = (mouse.x - cx) / cx, dy = (mouse.y - cy) / cy;
+        const sign = eff === "attract" ? -1 : 1;
+        canvas.style.transform = `rotate(${dx * dy * sign * 1.2}deg) translate(${dx * sign * amp * 0.4}px,${dy * sign * amp * 0.4}px)`;
+      } else {
+        canvas.style.transform = "";
+      }
+      rafRef.current = requestAnimationFrame(loop);
+    };
+    rafRef.current = requestAnimationFrame(loop);
+    return () => { cancelAnimationFrame(rafRef.current); canvas.style.transform = ""; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab, mode, videoRender, currentModeHasMedia, canvasSize]);
+
+  const handlePreviewPointerMove = useCallback((e: React.PointerEvent<HTMLCanvasElement>) => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    mouseRef.current = {
+      x: (e.clientX - rect.left) * ((previewCanvasRef.current?.width ?? 1) / rect.width),
+      y: (e.clientY - rect.top) * ((previewCanvasRef.current?.height ?? 1) / rect.height),
+    };
+  }, []);
+
+  const togglePlay = useCallback(() => {
+    const next = !videoPlaying; videoPlayingRef.current = next; setVideoPlaying(next);
+  }, [videoPlaying]);
+
+  /* ── Exports ── */
+  const exportJSON = useCallback(() => {
+    const clean = (d: DotCoord) => ({ x: Math.round(d.x), y: Math.round(d.y), r: +d.r.toFixed(2), ...(d.cr !== undefined ? { cr: d.cr, cg: d.cg, cb: d.cb } : {}) });
+    const data = isVideo ? JSON.stringify(ditherFramesRef.current.map(f => f.map(clean)), null, 2) : JSON.stringify(dotsRef.current.map(clean), null, 2);
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([data], { type: "application/json" }));
+    a.download = `${mediaName.replace(/\.[^.]+$/, "") || "dither"}-dots.json`; a.click();
+  }, [mediaName, isVideo, dotsRef]);
+
+  const copyJSON = useCallback(() => {
+    const clean = (d: DotCoord) => ({ x: Math.round(d.x), y: Math.round(d.y), r: +d.r.toFixed(2), ...(d.cr !== undefined ? { cr: d.cr, cg: d.cg, cb: d.cb } : {}) });
+    navigator.clipboard.writeText(JSON.stringify(dotsRef.current.map(clean)));
+    setCopied("json"); setTimeout(() => setCopied(null), 2000);
+  }, [dotsRef]);
+
+  const copyCode = useCallback(() => {
+    const p = paramsRef.current;
+    navigator.clipboard.writeText(generateInteractionCode(dotsRef.current, p.repelRadius, p.repelStrength));
+    setCopied("code"); setTimeout(() => setCopied(null), 2000);
+  }, [dotsRef]);
+
+  const copyAsciiCode = useCallback(() => {
+    const frames = asciiFramesRef.current; if (!frames.length) return;
+    navigator.clipboard.writeText(generateAsciiVideoCode(frames, videoFps, canvasSizeRef.current.w, canvasSizeRef.current.h, asciiParamsRef.current));
+    setCopied("ascii"); setTimeout(() => setCopied(null), 2000);
+  }, [videoFps]);
+
+  const exportPNG = useCallback(() => {
+    studioCanvasRef.current?.toBlob(blob => {
+      if (!blob) return;
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `${mediaName.replace(/\.[^.]+$/, "") || "mosaik"}.png`; a.click();
+    });
+  }, [mediaName]);
+
+  const exportSVG = useCallback(() => {
+    const d = dotsRef.current; if (!d.length) return;
+    const { w, h } = canvasSizeRef.current;
+    const svg = dotsToSVG(d, w, h, paramsRef.current.dotColor, paramsRef.current.bgColor);
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([svg], { type: "image/svg+xml" }));
+    a.download = `${mediaName.replace(/\.[^.]+$/, "") || "mosaik"}.svg`; a.click();
+  }, [mediaName, dotsRef]);
+
+  const showReactCode = useCallback(() => {
+    setCodeModal(generateReactCode(paramsRef.current, asciiParamsRef.current as unknown as Record<string, unknown>, mode, videoRender));
+  }, [mode, videoRender]);
+
+  const exportWebM = useCallback(() => {
+    const canvas = studioCanvasRef.current; if (!canvas || !videoFrameCount) return;
+    let mimeType = "video/webm;codecs=vp9";
+    if (!MediaRecorder.isTypeSupported(mimeType)) mimeType = "video/webm";
+    const stream = canvas.captureStream(videoFps);
+    const recorder = new MediaRecorder(stream, { mimeType });
+    const chunks: BlobPart[] = [];
+    recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
+    recorder.onstop = () => {
+      const blob = new Blob(chunks, { type: "video/webm" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `${mediaName.replace(/\.[^.]+$/, "") || "mosaik"}.webm`; a.click();
+      setExportingWebM(false);
+    };
+    const totalMs = (videoFrameCount / videoFps) * 1000 + 300;
+    setExportingWebM(true);
+    frameIdxRef.current = 0; videoPlayingRef.current = true; setVideoPlaying(true);
+    recorder.start(100);
+    setTimeout(() => { recorder.stop(); videoPlayingRef.current = false; setVideoPlaying(false); }, totalMs);
+  }, [videoFps, videoFrameCount, mediaName]);
+
+  const exportGIF = useCallback(async () => {
+    const canvas = tab === "preview" ? previewCanvasRef.current : studioCanvasRef.current;
+    if (!canvas || !hasMedia) return;
+
+    setExportingGIF(true);
+    const width = canvas.width;
+    const height = canvas.height;
+
+    // We'll use omggif which is already in the project
+    // Import dynamically to avoid SSR/Initial load weight
+    const { GifWriter } = await import("omggif");
+
+    const frames: Uint8Array[] = [];
+    const duration = isVideo ? (videoFrameCount / videoFps) : 2;
+    const captureFps = 12; // Lower FPS for GIF to keep size reasonable
+    const frameCount = Math.min(50, Math.floor(duration * captureFps));
+
+    // 1. Capture frames
+    for (let i = 0; i < frameCount; i++) {
+      const ctx = canvas.getContext("2d")!;
+      const imageData = ctx.getImageData(0, 0, width, height);
+      frames.push(new Uint8Array(imageData.data.buffer));
+      if (isVideo) {
+        // Advance video frame for capture
+        const nextIdx = Math.floor((i / frameCount) * videoFrameCount);
+        frameIdxRef.current = nextIdx;
+        setVideoCurFrame(nextIdx);
+        // Small wait for render
+        await new Promise(r => setTimeout(r, 40));
+      } else {
+        await new Promise(r => setTimeout(r, 1000 / captureFps));
+      }
+    }
+
+    try {
+      // 2. Prepare for GIF writing
+      // We need a palette. For dither, it's usually 2 colors. 
+      // For general cases, we'll build a palette from the first frame or use a fixed one.
+      // Since Mosaik is often high contrast, we'll extract up to 256 colors.
+      const buf = new Uint8Array(width * height * frameCount + 1024);
+      const gif = new GifWriter(buf, width, height, { loop: 0 });
+
+      const delay = Math.round(100 / captureFps);
+
+      for (const frame of frames) {
+        // Simple quantization: Map RGBA to indices
+        // For now, let's use a very basic palette of 256 colors
+        // A better approach would be Median Cut, but for dither, 
+        // we can often just find the used colors.
+        const colors: number[] = [];
+        const indices = new Uint8Array(width * height);
+
+        for (let j = 0; j < width * height; j++) {
+          const r = frame[j * 4], g = frame[j * 4 + 1], b = frame[j * 4 + 2];
+          const rgb = (r << 16) | (g << 8) | b;
+          let idx = colors.indexOf(rgb);
+          if (idx === -1) {
+            if (colors.length < 256) {
+              idx = colors.length;
+              colors.push(rgb);
+            } else {
+              // Simple nearest neighbor or just map to 0
+              idx = 0;
+            }
+          }
+          indices[j] = idx;
+        }
+
+        // Ensure palette is power of 2
+        while (colors.length < 2 || (colors.length & (colors.length - 1)) !== 0) {
+          colors.push(0);
+        }
+        if (colors.length > 256) colors.length = 256;
+
+        gif.addFrame(0, 0, width, height, indices as any, { palette: colors as any, delay });
+      }
+
+      const blob = new Blob([buf.slice(0, gif.end())], { type: "image/gif" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `${mediaName.replace(/\.[^.]+$/, "") || "mosaik"}.gif`;
+      a.click();
+    } catch (err) {
+      console.error("GIF export failed:", err);
+      alert("GIF export failed. The resulting file might be too large or complex for the browser's memory.");
+    } finally {
+      setExportingGIF(false);
+    }
+  }, [hasMedia, tab, isVideo, videoFrameCount, videoFps, mediaName]);
+
+  const exportCompare = useCallback(() => {
+    if (!compareCanvasRef.current || !studioCanvasRef.current) return;
+    const oc = compareCanvasRef.current;
+    const sc = studioCanvasRef.current;
+
+    const canvas = document.createElement("canvas");
+    canvas.width = oc.width + sc.width;
+    canvas.height = Math.max(oc.height, sc.height);
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    // Fill background
+    ctx.fillStyle = paramsRef.current.bgColor;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // Draw original
+    ctx.drawImage(oc, 0, 0);
+    // Draw Mosaik
+    ctx.drawImage(sc, oc.width, 0);
+
+    // Add labels
+    ctx.font = "bold 16px 'Inter', sans-serif";
+    ctx.shadowColor = "rgba(0,0,0,0.5)";
+    ctx.shadowBlur = 4;
+
+    // Label backgrounds
+    ctx.fillStyle = "rgba(0,0,0,0.6)";
+    ctx.fillRect(10, 10, 100, 30);
+    ctx.fillRect(oc.width + 10, 10, 100, 30);
+
+    ctx.fillStyle = "white";
+    ctx.fillText("ORIGINAL", 20, 31);
+    ctx.fillText("MOSAIKED", oc.width + 20, 31);
+
+    const link = document.createElement("a");
+    link.download = `mosaik-compare-${Date.now()}.png`;
+    link.href = canvas.toDataURL("image/png");
+    link.click();
+  }, []);
+
+  const applyPreset = useCallback((preset: Preset) => {
+    const p = preset.params; const ap = preset.asciiParams;
+    setParams(p); setAsciiParams(ap); paramsRef.current = p; asciiParamsRef.current = ap;
+    setMode(preset.mode); modeRef.current = preset.mode;
+    if (!imageRef.current) return;
+    if (preset.mode === "ascii") renderImageAscii(imageRef.current, ap);
+    else renderImageDither(imageRef.current, p);
+  }, [renderImageAscii, renderImageDither]);
+
+  const saveCurrentAsPreset = useCallback(() => {
+    const name = presetNameRef.current?.value?.trim() || "My Preset";
+    const newPreset: Preset = { id: `user_${Date.now()}`, name, mode, params: paramsRef.current, asciiParams: asciiParamsRef.current };
+    setUserPresets(prev => { const u = [...prev, newPreset]; localStorage.setItem("mosaik-presets", JSON.stringify(u)); return u; });
+    setShowSavePreset(false);
+  }, [mode]);
+
+  const deleteUserPreset = useCallback((id: string) => {
+    setUserPresets(prev => { const u = prev.filter(p => p.id !== id); localStorage.setItem("mosaik-presets", JSON.stringify(u)); return u; });
+  }, []);
+
+  // Draw original on compare canvas whenever compare is shown or frame changes
+  useEffect(() => {
+    if (!showCompare || !hasMedia) return;
+    const canvas = compareCanvasRef.current; if (!canvas) return;
+    const { w, h } = canvasSizeRef.current; canvas.width = w; canvas.height = h;
+    const ctx = canvas.getContext("2d")!;
+    if (isVideo) {
+      const raw = rawFramesRef.current[frameIdxRef.current]; if (raw) ctx.putImageData(raw, 0, 0);
+    } else if (imageRef.current) {
+      ctx.drawImage(imageRef.current, 0, 0, w, h);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showCompare, hasMedia, isVideo, videoCurrentFrame]);
+
+  const modeOptions = useMemo(() => [
+    { id: "image", label: "Image", Icon: ImageIcon },
+    { id: "video", label: "Video", Icon: Film },
+    { id: "ascii", label: "ASCII", Icon: Type },
+  ], []);
+
+  /* ══════════════════════════════════════════════════════════════ */
+
+  /* ══════════════════════════════════════════════════════════════ */
+  return (
+    <div className="mosaik-layout">
+
+      {/* ═══ SIDEBAR ═══ */}
+      <div className="mosaik-sidebar">
+
+        {/* Logo + Theme */}
+        <div style={{ padding: "16px 16px 12px", borderBottom: "1px solid var(--border)", flexShrink: 0 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <div style={{ width: 24, height: 24, borderRadius: 6, background: "linear-gradient(135deg,#00f2fe,#00d1ff)", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                <span style={{ fontSize: 12, fontWeight: 700, color: "#fff" }}>M</span>
+              </div>
+              <span style={{ fontFamily: "'Inter',sans-serif", fontSize: 14, fontWeight: 600, color: "var(--text)", letterSpacing: "-0.02em" }}>Mosaik ✦</span>
+            </div>
+            <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
+              <button onClick={() => setTheme(t => t === "dark" ? "light" : "dark")} title="Toggle theme"
+                style={{ background: "none", border: "none", cursor: "pointer", color: "var(--muted)", padding: 4, borderRadius: 4, display: "flex", alignItems: "center" }}>
+                {theme === "dark" ? <Sun size={13} /> : <Moon size={13} />}
+              </button>
+              <button onClick={resetParams} title="Reset"
+                style={{ background: "none", border: "none", cursor: "pointer", color: "var(--muted)", padding: 4, borderRadius: 4, display: "flex", alignItems: "center" }}>
+                <RefreshCw size={12} />
+              </button>
+              <button onClick={() => setShowAbout(true)} title="About"
+                style={{ background: "none", border: "none", cursor: "pointer", color: "var(--muted)", padding: 4, borderRadius: 4, display: "flex", alignItems: "center" }}>
+                <Info size={12} />
+              </button>
+            </div>
+          </div>
+          {hasMedia && (
+            <div style={{ marginTop: 8, display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+              {isVideo && <span style={{ fontSize: 10, fontFamily: "'JetBrains Mono',monospace", color: "var(--muted)", background: "var(--surface2)", border: "1px solid var(--border)", borderRadius: 4, padding: "2px 6px" }}><span style={{ color: "var(--accent)" }}>{videoFrameCount}</span> frames</span>}
+              {showDots && <span style={{ fontSize: 10, fontFamily: "'JetBrains Mono',monospace", color: "var(--muted)", background: "var(--surface2)", border: "1px solid var(--border)", borderRadius: 4, padding: "2px 6px" }}><span style={{ color: "var(--accent)" }}>{dotCount.toLocaleString()}</span> dots{isVideo ? "/f" : ""}</span>}
+              {(rendering || isLoading) && <span style={{ fontSize: 10, fontFamily: "'JetBrains Mono',monospace", color: "var(--accent)", marginLeft: "auto" }}>{isLoading ? `${Math.round(videoProgress * 100)}%` : "··"}</span>}
+            </div>
+          )}
+        </div>
+
+        {/* Mode selector */}
+        <div style={{ padding: "10px 12px", borderBottom: "1px solid var(--border)", flexShrink: 0 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 4 }}>
+            {modeOptions.map(({ id, label, Icon }) => (
+              <button key={id} onClick={() => setMode(id as Mode)} className={`btn-chip${mode === id ? " active" : ""}`}
+                style={{ flexDirection: "column", gap: 4, padding: "7px 4px", fontSize: 9 }}>
+                <Icon size={11} />{label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {isVideo && <SubToggle value={videoRender} onChange={setVideoRender} />}
+
+        {/* Scrollable controls */}
+        <div className="mosaik-controls-scroller">
+
+          {/* ── Presets ── */}
+          {(mode === "image" || (isVideo && videoRender === "dither")) && (<>
+            <Section title="Characters">
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4 }}>
+                {ALGORITHMS.map(a => (
+                  <button key={a.value} onClick={() => setParamLive("algorithm", a.value)}
+                    className={`btn-chip${params.algorithm === a.value ? " active" : ""}`}>{a.label}</button>
+                ))}
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 4, marginTop: 8 }}>
+                <span style={{ color: "var(--muted)", fontSize: 10, fontFamily: "'JetBrains Mono',monospace", letterSpacing: "0.06em" }}>GRID TYPE</span>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 4 }}>
+                  {(["square", "hex", "offset"] as const).map(g => (
+                    <button key={g} onClick={() => setParamLive("gridType", g)}
+                      className={`btn-chip${params.gridType === g ? " active" : ""}`} style={{ fontSize: 9 }}>{g}</button>
+                  ))}
+                </div>
+              </div>
+              <Slider label="SPACING" value={params.scale} min={2} max={20} step={1} onChange={v => setParamLive("scale", v)} unit="px" />
+              <Slider label="MIN RADIUS" value={params.dotMinRadius} min={0.3} max={4} step={0.1} decimals={1} onChange={v => setParamLive("dotMinRadius", v)} unit="px" />
+              <Slider label="MAX RADIUS" value={params.dotMaxRadius} min={0.5} max={8} step={0.1} decimals={1} onChange={v => setParamLive("dotMaxRadius", v)} unit="px" />
+            </Section>
+
+            <Section title="Style & Color">
+              <ColorRow label="BACKGROUND" value={params.bgColor} onChange={v => setParamLive("bgColor", v)} />
+              <Toggle label="SOURCE COLORS" value={params.useSourceColor} onChange={v => setParamLive("useSourceColor", v)} />
+              {!params.useSourceColor && !params.usePalette && <ColorRow label="DOTS" value={params.dotColor} onChange={v => setParamLive("dotColor", v)} />}
+
+              <div style={{ borderTop: "1px solid var(--border)", marginTop: 8, paddingTop: 8, display: "flex", flexDirection: "column", gap: 8 }}>
+                <Toggle label="PALETTE MAPPING" value={params.usePalette} onChange={v => setParamLive("usePalette", v)} />
+                {params.usePalette && (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                    <span style={{ color: "var(--muted)", fontSize: 10, fontFamily: "'JetBrains Mono',monospace", letterSpacing: "0.06em" }}>PRESET</span>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4 }}>
+                      {PALETTES.map(p => (
+                        <button key={p.id} onClick={() => setParamLive("paletteId", p.id)}
+                          className={`btn-chip${params.paletteId === p.id ? " active" : ""}`} style={{ fontSize: 9 }}>{p.name}</button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </Section>
+
+            <Section title="Refinement">
+              <Slider label="THRESHOLD" value={params.threshold} min={0} max={255} step={1} onChange={v => setParamLive("threshold", v)} />
+              <Slider label="CONTRAST" value={params.contrast} min={-100} max={100} step={1} onChange={v => setParamLive("contrast", v)} />
+              <Slider label="BRIGHTNESS" value={params.brightness} min={-100} max={100} step={1} onChange={v => setParamLive("brightness", v)} />
+              <Slider label="GAMMA" value={params.gamma} min={0.2} max={3} step={0.05} decimals={2} onChange={v => setParamLive("gamma", v)} />
+              <Slider label="BLUR" value={params.blur} min={0} max={5} step={0.1} decimals={1} onChange={v => setParamLive("blur", v)} />
+              <Slider label="HIGHLIGHTS" value={params.highlightCompression} min={0} max={1} step={0.01} decimals={2} onChange={v => setParamLive("highlightCompression", v)} />
+              <Slider label="ERROR STR." value={params.errorStrength} min={0} max={1} step={0.01} decimals={2} onChange={v => setParamLive("errorStrength", v)} />
+              <Toggle label="SERPENTINE" value={params.serpentine} onChange={v => setParamLive("serpentine", v)} />
+              <Toggle label="INVERT" value={params.invert} onChange={v => setParamLive("invert", v)} />
+              <Toggle label="CRT EFFECT" value={params.crtEffect} onChange={v => setParamLive("crtEffect", v)} />
+            </Section>
+
+            <Section title="Repulsion">
+              <Slider label="RADIUS" value={params.repelRadius} min={20} max={200} step={1} onChange={v => setParamLive("repelRadius", v)} unit="px" />
+              <Slider label="STRENGTH" value={params.repelStrength} min={5} max={200} step={1} onChange={v => setParamLive("repelStrength", v)} unit="px" />
+            </Section>
+
+            <Section title="Advanced" defaultOpen={false}>
+              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                <span style={{ color: "var(--muted)", fontSize: 10, fontFamily: "'JetBrains Mono',monospace", letterSpacing: "0.06em" }}>CUSTOM GLYPH</span>
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <label className="btn-chip" style={{ flex: 1, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 6, fontSize: 10 }}>
+                    <Upload size={11} /> {params.customGlyph ? "Change Glyph" : "Upload SVG/PNG"}
+                    <input type="file" accept="image/svg+xml,image/png" style={{ display: "none" }}
+                      onChange={e => {
+                        const f = e.target.files?.[0];
+                        if (f) {
+                          const reader = new FileReader();
+                          reader.onload = e => setParamLive("customGlyph", e.target?.result as string);
+                          reader.readAsDataURL(f);
+                        }
+                      }} />
+                  </label>
+                  {params.customGlyph && (
+                    <button onClick={() => setParamLive("customGlyph", null)} className="btn-ghost" style={{ padding: 6, borderRadius: 6 }}>
+                      <XIcon size={12} />
+                    </button>
+                  )}
+                </div>
+                {params.customGlyph && (
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, padding: 8, background: "var(--surface2)", borderRadius: 8 }}>
+                    <img src={params.customGlyph} style={{ width: 24, height: 24, objectFit: "contain" }} alt="Custom glyph" />
+                    <span style={{ fontSize: 9, color: "var(--muted)", fontFamily: "'JetBrains Mono',monospace" }}>Active Stamp</span>
+                  </div>
+                )}
+              </div>
+
+              <div style={{ borderTop: "1px solid var(--border)", marginTop: 8, paddingTop: 8 }}>
+                <span style={{ color: "var(--muted)", fontSize: 10, fontFamily: "'JetBrains Mono',monospace", letterSpacing: "0.06em", display: "block", marginBottom: 6 }}>GLYPH OVERLAY</span>
+                <Toggle label="ENABLE GLYPH LAYER" value={params.glyphOverlay} onChange={v => setParamLive("glyphOverlay", v)} />
+                {params.glyphOverlay && (<>
+                  <Slider label="GLYPH RADIUS" value={params.glyphRadius} min={0.5} max={8} step={0.1} decimals={1} onChange={v => setParamLive("glyphRadius", v)} unit="px" />
+                  <Slider label="GLYPH SPACING" value={params.glyphSpacing} min={2} max={30} step={1} onChange={v => setParamLive("glyphSpacing", v)} unit="px" />
+                  <Toggle label="EDGE ONLY" value={params.glyphEdgeOnly} onChange={v => setParamLive("glyphEdgeOnly", v)} />
+                  {params.glyphEdgeOnly && <Slider label="EDGE THRESHOLD" value={params.glyphEdgeThreshold} min={5} max={200} step={1} onChange={v => setParamLive("glyphEdgeThreshold", v)} />}
+                </>)}
+              </div>
+
+              <div style={{ borderTop: "1px solid var(--border)", marginTop: 8, paddingTop: 8 }}>
+                <span style={{ color: "var(--muted)", fontSize: 10, fontFamily: "'JetBrains Mono',monospace", letterSpacing: "0.06em", display: "block", marginBottom: 6 }}>COLOR OVERLAY</span>
+                <ColorRow label="TINT COLOR" value={params.overlayColor} onChange={v => setParamLive("overlayColor", v)} />
+                <Slider label="OPACITY" value={params.overlayOpacity} min={0} max={1} step={0.01} decimals={2} onChange={v => setParamLive("overlayOpacity", v)} />
+                <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                  <span style={{ color: "var(--muted)", fontSize: 10, fontFamily: "'JetBrains Mono',monospace", letterSpacing: "0.06em" }}>BLEND MODE</span>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4 }}>
+                    {BLEND_MODES.map(b => (
+                      <button key={b.value} onClick={() => setParamLive("blendMode", b.value)}
+                        className={`btn-chip${params.blendMode === b.value ? " active" : ""}`} style={{ fontSize: 9 }}>{b.label}</button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </Section>
+
+            <Section title="Resolution" defaultOpen={false}>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
+                <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                  <span style={{ color: "var(--muted)", fontSize: 10, fontFamily: "'JetBrains Mono',monospace" }}>WIDTH</span>
+                  <input type="number" value={params.exportWidth} min={100} max={4000}
+                    onChange={e => { const w = Math.max(100, Math.min(4000, parseInt(e.target.value) || 100)); setParamLive("exportWidth", w); if (params.lockAspect && canvasSizeRef.current.w > 0) setParamLive("exportHeight", Math.round(w * (canvasSizeRef.current.h / canvasSizeRef.current.w))); }}
+                    style={{ background: "var(--surface2)", border: "1px solid var(--border)", color: "var(--text)", padding: "5px 8px", fontSize: 11, fontFamily: "'JetBrains Mono',monospace", borderRadius: 6, outline: "none", width: "100%" }} />
+                </div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                  <span style={{ color: "var(--muted)", fontSize: 10, fontFamily: "'JetBrains Mono',monospace" }}>HEIGHT</span>
+                  <input type="number" value={params.exportHeight} min={100} max={4000}
+                    onChange={e => { const h = Math.max(100, Math.min(4000, parseInt(e.target.value) || 100)); setParamLive("exportHeight", h); if (params.lockAspect && canvasSizeRef.current.h > 0) setParamLive("exportWidth", Math.round(h * (canvasSizeRef.current.w / canvasSizeRef.current.h))); }}
+                    style={{ background: "var(--surface2)", border: "1px solid var(--border)", color: "var(--text)", padding: "5px 8px", fontSize: 11, fontFamily: "'JetBrains Mono',monospace", borderRadius: 6, outline: "none", width: "100%" }} />
+                </div>
+              </div>
+              <Toggle label="LOCK ASPECT" value={params.lockAspect} onChange={v => setParamLive("lockAspect", v)} />
+              <p style={{ fontSize: 9, color: "var(--muted)", fontFamily: "'JetBrains Mono',monospace", lineHeight: 1.6 }}>Re-upload to apply resolution change.</p>
+            </Section>
+
+            <Section title="Presets" defaultOpen={false}>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+                {BUILT_IN_PRESETS.map(p => (
+                  <button key={p.name} onClick={() => applyPreset(p)}
+                    className="btn-chip"
+                    style={{ fontSize: 9, padding: "3px 8px" }}>
+                    {p.name}
+                  </button>
+                ))}
+              </div>
+              {userPresets.length > 0 && (
+                <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 4 }}>
+                  <span style={{ fontSize: 9, color: "var(--muted)", fontFamily: "'JetBrains Mono',monospace", letterSpacing: "0.05em" }}>CUSTOM</span>
+                  {userPresets.map(p => (
+                    <div key={p.name} style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                      <button onClick={() => applyPreset(p)} className="btn-chip" style={{ flex: 1, fontSize: 9, padding: "3px 8px", textAlign: "left" }}>{p.name}</button>
+                      <button onClick={() => deleteUserPreset(p.id)} style={{ background: "none", border: "none", cursor: "pointer", padding: "2px 4px", color: "var(--muted)", borderRadius: 4 }} title="Delete">
+                        <XIcon size={10} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {showSavePreset ? (
+                <div style={{ display: "flex", gap: 4, marginTop: 4 }}>
+                  <input id="preset-name-input" autoFocus placeholder="Preset name…"
+                    style={{ flex: 1, background: "var(--surface2)", border: "1px solid var(--border)", borderRadius: 6, padding: "4px 8px", fontSize: 10, color: "var(--text)", fontFamily: "'JetBrains Mono',monospace", outline: "none" }}
+                    onKeyDown={e => { if (e.key === "Enter") { saveCurrentAsPreset(); } if (e.key === "Escape") setShowSavePreset(false); }} />
+                  <button onClick={saveCurrentAsPreset} className="btn-primary" style={{ borderRadius: 6, padding: "4px 8px", fontSize: 10 }}>Save</button>
+                  <button onClick={() => setShowSavePreset(false)} className="btn-ghost" style={{ borderRadius: 6, padding: "4px 8px", fontSize: 10 }}>✕</button>
+                </div>
+              ) : (
+                <button onClick={() => setShowSavePreset(true)} className="btn-ghost" style={{ width: "100%", borderRadius: 6, padding: "5px 8px", fontSize: 10, marginTop: 4, display: "flex", alignItems: "center", justifyContent: "center", gap: 4 }}>
+                  <Plus size={10} /> Save current as preset
+                </button>
+              )}
+            </Section>
+          </>)}
+
+          {(mode === "ascii" || (isVideo && videoRender === "ascii")) && (<>
+            <Section title="Characters">
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4 }}>
+                {ASCII_CHARSET_OPTS.map(o => (
+                  <button key={o.value} onClick={() => setAsciiParamLive("charset", o.value)}
+                    className={`btn-chip${asciiParams.charset === o.value ? " active" : ""}`}
+                    style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 9 }}>{o.label}</button>
+                ))}
+              </div>
+              {asciiParams.charset === "custom" && (
+                <input value={asciiParams.customCharset} onChange={e => setAsciiParamLive("customCharset", e.target.value)} placeholder="@#%+:. "
+                  style={{ background: "var(--surface2)", border: "1px solid var(--border)", color: "var(--text)", padding: "6px 8px", fontSize: 11, fontFamily: "'JetBrains Mono',monospace", borderRadius: 6, outline: "none", width: "100%" }} />
+              )}
+            </Section>
+            <Section title="Type &amp; Spacing">
+              <Slider label="FONT SIZE" value={asciiParams.fontSize} min={4} max={24} step={1} onChange={v => setAsciiParamLive("fontSize", v)} unit="px" />
+              <Slider label="CHAR SPACING" value={asciiParams.charSpacing} min={0.4} max={2.0} step={0.05} decimals={2} onChange={v => setAsciiParamLive("charSpacing", v)} unit="×" />
+              <Slider label="LINE SPACING" value={asciiParams.lineSpacing} min={0.8} max={2.5} step={0.05} decimals={2} onChange={v => setAsciiParamLive("lineSpacing", v)} unit="×" />
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 4 }}>
+                {(["monospace", "courier", "consolas"] as const).map(f => (
+                  <button key={f} onClick={() => setAsciiParamLive("fontFamily", f)}
+                    className={`btn-chip${asciiParams.fontFamily === f ? " active" : ""}`}
+                    style={{ fontFamily: f, fontSize: 9, padding: "5px 4px" }}>{f}</button>
+                ))}
+              </div>
+            </Section>
+            <Section title="Style & Tone">
+              <Toggle label="INVERT" value={asciiParams.invertBrightness} onChange={v => setAsciiParamLive("invertBrightness", v)} />
+              <Slider label="CONTRAST" value={asciiParams.contrast} min={-100} max={100} step={1} onChange={v => setAsciiParamLive("contrast", v)} />
+              <Slider label="BRIGHTNESS" value={asciiParams.brightness} min={-100} max={100} step={1} onChange={v => setAsciiParamLive("brightness", v)} />
+              <Slider label="GAMMA" value={asciiParams.gamma} min={0.2} max={3} step={0.05} decimals={2} onChange={v => setAsciiParamLive("gamma", v)} />
+            </Section>
+            <Section title="Colors &amp; Glow">
+              <Toggle label="SOURCE COLORS" value={asciiParams.colored} onChange={v => setAsciiParamLive("colored", v)} />
+              {!asciiParams.colored && <ColorRow label="CHARACTERS" value={asciiParams.fgColor} onChange={v => setAsciiParamLive("fgColor", v)} />}
+              <ColorRow label="BACKGROUND" value={asciiParams.bgColor} onChange={v => setAsciiParamLive("bgColor", v)} />
+              <Toggle label="NEON GLOW" value={asciiParams.glow} onChange={v => setAsciiParamLive("glow", v)} />
+              {asciiParams.glow && (<>
+                <ColorRow label="GLOW COLOR" value={asciiParams.glowColor} onChange={v => setAsciiParamLive("glowColor", v)} />
+                <Slider label="GLOW RADIUS" value={asciiParams.glowRadius} min={1} max={20} step={1} onChange={v => setAsciiParamLive("glowRadius", v)} unit="px" />
+              </>)}
+            </Section>
+          </>)}
+
+          {isVideo && (
+            <Section title="Video">
+              <Slider label="EXTRACT FPS" value={videoFps} min={6} max={60} step={1} onChange={setVideoFps} unit="fps" />
+              <p style={{ fontSize: 9, color: "var(--muted)", fontFamily: "'JetBrains Mono',monospace", lineHeight: 1.6 }}>Re-upload to apply FPS change.</p>
+            </Section>
+          )}
+        </div>
+
+        {/* Export panel */}
+        <div style={{ padding: "12px 12px 14px", borderTop: "1px solid var(--border)", flexShrink: 0, display: "flex", flexDirection: "column", gap: 6 }}>
+          <div style={{ display: "grid", gridTemplateColumns: showDots ? "1fr 1fr" : "1fr", gap: 6 }}>
+            {showDots && (
+              <button onClick={exportJSON} disabled={!currentModeHasMedia} className="btn-primary" style={{ borderRadius: 8, padding: "7px 10px", fontSize: 10 }}>
+                <Download size={11} /> Export JSON
+              </button>
+            )}
+            <button onClick={exportPNG} disabled={!currentModeHasMedia} className="btn-primary" style={{ borderRadius: 8, padding: "7px 10px", fontSize: 10 }}>
+              <Download size={11} /> Export PNG
+            </button>
+          </div>
+          {showDots && (
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
+              <button onClick={copyJSON} disabled={!currentModeHasMedia} className="btn-ghost" style={{ borderRadius: 8, padding: "7px 10px", fontSize: 10 }}>
+                {copied === "json" ? <Check size={11} /> : <Copy size={11} />} {copied === "json" ? "Copied!" : "Copy JSON"}
+              </button>
+              <button onClick={copyCode} disabled={!currentModeHasMedia} className="btn-ghost" style={{ borderRadius: 8, padding: "7px 10px", fontSize: 10 }}>
+                {copied === "code" ? <Check size={11} /> : <Code size={11} />} {copied === "code" ? "Copied!" : "Copy JS"}
+              </button>
+            </div>
+          )}
+          {isAscii && (
+            <button onClick={copyAsciiCode} disabled={!currentModeHasMedia} className="btn-ghost" style={{ borderRadius: 8, padding: "7px 10px", fontSize: 10, width: "100%" }}>
+              {copied === "ascii" ? <Check size={11} /> : <Code size={11} />} {copied === "ascii" ? "Copied!" : "Copy ASCII Player JS"}
+            </button>
+          )}
+          {showDots && (
+            <button onClick={exportSVG} disabled={!currentModeHasMedia} className="btn-ghost" style={{ borderRadius: 8, padding: "7px 10px", fontSize: 10, width: "100%" }}>
+              <Download size={11} /> Export SVG
+            </button>
+          )}
+          {isVideo && (
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
+              <button onClick={exportWebM} disabled={!currentModeHasMedia || exportingWebM} className="btn-ghost" style={{ borderRadius: 8, padding: "7px 10px", fontSize: 10 }}>
+                <FileVideo size={11} /> {exportingWebM ? "Recording…" : "Export WebM"}
+              </button>
+              <button onClick={exportGIF} disabled={!currentModeHasMedia || exportingGIF} className="btn-ghost" style={{ borderRadius: 8, padding: "7px 10px", fontSize: 10 }}>
+                <Film size={11} /> {exportingGIF ? "Recording…" : "Export GIF"}
+              </button>
+            </div>
+          )}
+          {!isVideo && (
+            <button onClick={exportGIF} disabled={!currentModeHasMedia || exportingGIF} className="btn-ghost" style={{ borderRadius: 8, padding: "7px 10px", fontSize: 10, width: "100%" }}>
+              <Film size={11} /> {exportingGIF ? "Recording…" : "Export GIF"}
+            </button>
+          )}
+          <button onClick={showReactCode} disabled={!currentModeHasMedia} className="btn-primary" style={{ borderRadius: 8, padding: "7px 10px", fontSize: 10, width: "100%" }}>
+            <Code size={11} /> Copy React Code
+          </button>
+        </div>
+      </div>
+
+      {/* ── RIGHT PANEL ── */}
+      <div className="mosaik-main">
+
+        {/* Tab bar — 3-zone layout: [tabs] [contextual center flex:1] [compare btn] [github] */}
+        <div className="mosaik-topbar">
+          {/* LEFT: Studio | Preview tabs */}
+          <div style={{ display: "flex", height: "100%" }}>
+            {(["studio", "preview"] as Tab[]).map(t => (
+              <button key={t} onClick={() => setTab(t)}
+                style={{ padding: "0 16px", height: "100%", fontSize: 11, fontFamily: "'Inter',sans-serif", fontWeight: 500, background: "none", border: "none", borderBottom: tab === t ? "2px solid var(--accent)" : "2px solid transparent", color: tab === t ? "var(--text)" : "var(--muted)", cursor: "pointer", transition: "color 0.15s", textTransform: "capitalize" }}>
+                {t}
+              </button>
+            ))}
+          </div>
+          {/* CENTER: contextual info */}
+          <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center" }}>
+            {isVideo && hasMedia && !isLoading && tab === "studio" && (
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <span style={{ fontSize: 10, fontFamily: "'JetBrains Mono',monospace", color: "var(--muted)", display: "flex", alignItems: "center", gap: 6 }}>
+                  {videoCurrentFrame + 1}/{videoFrameCount}
+                  {showCompare && (
+                    <span style={{ display: "flex", alignItems: "center", gap: 3, opacity: 0.7, borderLeft: "1px solid var(--border)", paddingLeft: 6, marginLeft: 2 }}>
+                      <Info size={10} /> Paused frame will be saved
+                    </span>
+                  )}
+                </span>
+                <button onClick={togglePlay} className="btn-ghost" style={{ borderRadius: 8, padding: "5px 12px", fontSize: 10 }}>
+                  {videoPlaying ? <Pause size={11} /> : <Play size={11} />} {videoPlaying ? "Pause" : "Play"}
+                </button>
+              </div>
+            )}
+            {tab === "preview" && hasMedia && (
+              <div style={{ display: "flex", alignItems: "center", gap: 3 }}>
+                {(["repel", "attract", "wave", "noise", "vortex", "breathe"] as const).map(e => (
+                  <button key={e} onClick={() => setEffect(e)}
+                    className={`btn-chip${effect === e ? " active" : ""}`}
+                    style={{ fontSize: 9, padding: "3px 8px", textTransform: "capitalize" }}>
+                    {e === "noise" ? "Noise" : e === "repel" ? "Repel" : e === "attract" ? "Attract" : e === "wave" ? "Wave" : e === "vortex" ? "Vortex" : "Breathe"}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+          {/* RIGHT: Compare toggle + GitHub */}
+          {currentModeHasMedia && (
+            <div style={{ display: "flex", alignItems: "center", gap: 6, marginRight: 8 }}>
+              <button onClick={() => { setShowCompare(c => !c); if (!showCompare) setTab("studio"); }}
+                style={{ display: "flex", alignItems: "center", gap: 4, background: showCompare ? "var(--accent)" : "var(--surface2)", border: `1px solid ${showCompare ? "var(--accent)" : "var(--border)"}`, borderRadius: 6, padding: "4px 9px", cursor: "pointer", flexShrink: 0, transition: "all 0.15s" }}>
+                <Columns2 size={11} color={showCompare ? "#fff" : "var(--muted)"} />
+                <span style={{ fontSize: 10, fontFamily: "'Inter',sans-serif", fontWeight: 500, color: showCompare ? "#fff" : "var(--muted)" }}>Compare</span>
+              </button>
+              {showCompare && (
+                <button onClick={exportCompare} className="btn-primary" style={{ padding: "4px 9px", borderRadius: 6, fontSize: 10, gap: 4 }}>
+                  <Download size={11} /> Save Image
+                </button>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* Canvas area */}
+        {showCompare && currentModeHasMedia ? (
+          /* ── Compare split view ── */
+          <div style={{ flex: 1, display: "flex", overflow: "hidden", position: "relative" }}
+            onPointerMove={e => {
+              if (!isDraggingSplitRef.current) return;
+              const rect = e.currentTarget.getBoundingClientRect();
+              setSplitRatio(Math.max(0.1, Math.min(0.9, (e.clientX - rect.left) / rect.width)));
+            }}
+            onPointerUp={() => { isDraggingSplitRef.current = false; }}>
+            <div style={{ width: `${splitRatio * 100}%`, flexShrink: 0, background: "var(--bg)", display: "flex", alignItems: "center", justifyContent: "center", overflow: "hidden", position: "relative" }}>
+              <span style={{ position: "absolute", top: 8, left: 8, fontSize: 9, fontFamily: "'JetBrains Mono',monospace", color: "var(--muted)", background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 4, padding: "2px 6px", zIndex: 2 }}>ORIGINAL</span>
+              <canvas ref={compareCanvasRef} style={{ maxWidth: "100%", maxHeight: "100%" }} />
+            </div>
+            <div onPointerDown={e => { isDraggingSplitRef.current = true; (e.target as HTMLElement).setPointerCapture(e.pointerId); }}
+              style={{ width: 4, background: "var(--accent)", cursor: "ew-resize", flexShrink: 0, zIndex: 10, position: "relative" }}>
+              <div style={{ position: "absolute", top: "50%", left: "50%", transform: "translate(-50%,-50%)", width: 20, height: 20, borderRadius: "50%", background: "var(--accent)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5"><path d="M8 12H16M4 12L8 8M4 12L8 16M20 12L16 8M20 12L16 16" /></svg>
+              </div>
+            </div>
+            <div style={{ flex: 1, background: canBg, display: "flex", alignItems: "center", justifyContent: "center", overflow: "hidden", position: "relative" }}>
+              <span style={{ position: "absolute", top: 8, right: 8, fontSize: 9, fontFamily: "'JetBrains Mono',monospace", color: "var(--muted)", background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 4, padding: "2px 6px", zIndex: 2 }}>MOSAIKED</span>
+              <canvas ref={studioCanvasRef} style={{ maxWidth: "100%", maxHeight: "100%" }} />
+            </div>
+          </div>
+        ) : (
+          /* ── Normal canvas area ── */
+          <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", background: canBg, overflow: "hidden", position: "relative" }}
+            onDragOver={e => e.preventDefault()} onDrop={handleDrop}>
+
+            <canvas ref={studioCanvasRef} style={{ display: (currentModeHasMedia && tab === "studio") ? "block" : "none", maxWidth: "100%", maxHeight: "100%" }} />
+            <canvas ref={previewCanvasRef} onPointerMove={handlePreviewPointerMove} onPointerLeave={() => { mouseRef.current = { x: -9999, y: -9999 }; }}
+              style={{ display: (currentModeHasMedia && tab === "preview") ? "block" : "none", maxWidth: "100%", maxHeight: "100%", cursor: !isAscii ? "none" : "default", touchAction: "none" }} />
+
+            {/* Play/Pause Overlay */}
+            {isVideo && currentModeHasMedia && tab === "studio" && !isLoading && (
+              <div onClick={togglePlay} className="video-overlay" style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", transition: "all 0.2s" }}>
+                <div className="video-play-btn" style={{ width: 80, height: 80, borderRadius: "50%", background: "rgba(0,0,0,0.4)", border: "1px solid rgba(255,255,255,0.2)", display: "flex", alignItems: "center", justifyContent: "center", color: "#fff", backdropFilter: "blur(4px)", transform: videoPlaying ? "scale(0.8)" : "scale(1)", opacity: videoPlaying ? 0 : 1, transition: "all 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275)" }}>
+                  {videoPlaying ? <Pause size={32} /> : <Play size={32} style={{ marginLeft: 4 }} />}
+                </div>
+              </div>
+            )}
+
+            {!currentModeHasMedia && !isLoading && (
+              <label htmlFor="dither-file-input"
+                onDragOver={e => { e.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)}
+                onDrop={e => { setDragging(false); handleDrop(e); }}
+                style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", cursor: "pointer", gap: 16, zIndex: 10, background: dragging ? "rgba(0,209,255,0.05)" : "transparent", border: dragging ? "2px dashed var(--accent)" : "2px dashed transparent", transition: "all 0.15s" }}>
+                <div style={{ width: 72, height: 72, borderRadius: "50%", background: "var(--surface)", border: "1px solid var(--border)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                  {isVideo ? <Film size={28} color="var(--muted)" /> : mode === "ascii" ? <Type size={28} color="var(--muted)" /> : <Upload size={28} color="var(--muted)" />}
+                </div>
+                <div style={{ textAlign: "center", display: "flex", flexDirection: "column", gap: 6, alignItems: "center" }}>
+                  <p style={{ color: "var(--text)", fontFamily: "'Inter',sans-serif", fontWeight: 500, fontSize: 14 }}>{isVideo ? "Drop a video" : "Drop an image"}</p>
+                  <p style={{ color: "var(--muted)", fontSize: 12 }}>{isVideo ? "MP4, WebM, MOV, GIF" : "PNG, JPG, SVG, WebP, GIF"}</p>
+                  <div className="btn-primary" style={{ marginTop: 4, borderRadius: 10, padding: "8px 20px", fontSize: 12, pointerEvents: "none", display: "inline-flex", alignItems: "center", gap: 6 }}>
+                    <Upload size={12} /> Browse files
+                  </div>
+                </div>
+              </label>
+            )}
+
+            {isLoading && (
+              <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 16, background: "var(--bg)" }}>
+                <div style={{ width: 260, height: 2, background: "var(--border)", borderRadius: 1, overflow: "hidden" }}>
+                  <div style={{ height: "100%", width: `${videoProgress * 100}%`, background: "linear-gradient(to right,var(--accent-from),var(--accent))", transition: "width 0.2s", borderRadius: 1 }} />
+                </div>
+                <span style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 11, color: "var(--muted)" }}>{progressLabel}</span>
+              </div>
+            )}
+
+            {currentModeHasMedia && !isLoading && (
+              <label htmlFor="dither-file-input" style={{ position: "absolute", bottom: 14, right: 14, cursor: "pointer", zIndex: 20 }}>
+                <span className="btn-primary" style={{ borderRadius: 10, padding: "8px 16px", fontSize: 11, display: "inline-flex", alignItems: "center", gap: 6, backdropFilter: "blur(12px)", background: "rgba(0,209,255,0.85)", border: "1px solid rgba(255,255,255,0.15)", boxShadow: "0 4px 12px rgba(0,0,0,0.25)" }}>
+                  <Upload size={12} /> Change {isVideo ? "video" : "image"}
+                </span>
+              </label>
+            )}
+
+            {tab === "preview" && !currentModeHasMedia && (
+              <p style={{ color: "var(--muted)", fontFamily: "'JetBrains Mono',monospace", fontSize: 11 }}>Load media in Studio first</p>
+            )}
+          </div>
+        )}
+      </div>
+
+
+      <input ref={fileInputRef} id="dither-file-input" type="file"
+        accept="image/*,image/gif,video/*,video/mp4,video/webm,video/quicktime"
+        style={{ position: "fixed", top: -9999, left: -9999, opacity: 0, width: 1, height: 1 }}
+        onChange={e => { const f = e.target.files?.[0]; if (f) handleFile(f); e.target.value = ""; }} />
+
+
+      {showAbout && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.8)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", padding: 24 }}
+          onClick={() => setShowAbout(false)}>
+          <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 12, padding: 32, maxWidth: 500, width: "100%", display: "flex", flexDirection: "column", gap: 16 }}
+            onClick={e => e.stopPropagation()}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <div style={{ width: 28, height: 28, borderRadius: 6, background: "linear-gradient(135deg,#00f2fe,#00d1ff)", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                  <span style={{ fontSize: 14, fontWeight: 700, color: "#fff" }}>M</span>
+                </div>
+                <span style={{ fontFamily: "'Inter',sans-serif", fontSize: 18, fontWeight: 600, color: "var(--text)" }}>Mosaik ✦</span>
+              </div>
+              <button className="btn-ghost" style={{ borderRadius: 8, padding: "6px 14px", fontSize: 12 }} onClick={() => setShowAbout(false)}>Close</button>
+            </div>
+
+            <p style={{ color: "var(--muted)", fontSize: 14, lineHeight: 1.6 }}>
+              Mosaik is an advanced, interactive studio for creating stunning dithered art, retro ASCII animations, and custom dot matrix graphics directly in your browser.
+            </p>
+
+            <div style={{ marginTop: 8 }}>
+              <h4 style={{ color: "var(--text)", fontSize: 13, marginBottom: 8, fontWeight: 600 }}>Features</h4>
+              <ul style={{ color: "var(--muted)", fontSize: 13, lineHeight: 1.8, paddingLeft: 20 }}>
+                <li>Real-time image and video dithering</li>
+                <li>Multiple dithering algorithms (Floyd-Steinberg, Atkinson, etc.)</li>
+                <li>Interactive physics in Preview mode</li>
+                <li>Customizable ASCII art generation</li>
+                <li>High performance web worker processing</li>
+              </ul>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {codeModal && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.8)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", padding: 24 }}
+          onClick={() => setCodeModal(null)}>
+          <div style={{ background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 12, padding: 24, maxWidth: 700, width: "100%", maxHeight: "80vh", display: "flex", flexDirection: "column", gap: 12 }}
+            onClick={e => e.stopPropagation()}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+              <span style={{ fontFamily: "'Inter',sans-serif", fontWeight: 600, fontSize: 14, color: "var(--text)" }}>React Code</span>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button className="btn-primary" style={{ borderRadius: 8, padding: "6px 14px", fontSize: 11 }}
+                  onClick={() => { if (codeModal) navigator.clipboard.writeText(codeModal); setCopied("react"); setTimeout(() => setCopied(null), 2000); }}>
+                  {copied === "react" ? <Check size={11} /> : <Copy size={11} />} {copied === "react" ? "Copied!" : "Copy"}
+                </button>
+                <button className="btn-ghost" style={{ borderRadius: 8, padding: "6px 14px", fontSize: 11 }} onClick={() => setCodeModal(null)}>Close</button>
+              </div>
+            </div>
+            <pre style={{ overflowY: "auto", flex: 1, background: "var(--surface2)", borderRadius: 8, padding: 16, fontSize: 11, fontFamily: "'JetBrains Mono',monospace", color: "var(--text)", margin: 0, lineHeight: 1.6, whiteSpace: "pre-wrap" }}>
+              {codeModal}
+            </pre>
+            <p style={{ fontSize: 10, color: "var(--muted)", fontFamily: "'JetBrains Mono',monospace" }}>npm install mosaik-react</p>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
