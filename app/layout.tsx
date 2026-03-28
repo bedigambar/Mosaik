@@ -2,7 +2,7 @@ import type { Metadata, Viewport } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  metadataBase: new URL('https://mosaik-studio.vercel.app'), // Replace with your actual deployed URL
+  metadataBase: new URL('https://mosaik-theta.vercel.app'), // Replace with your actual deployed URL
   title: "Mosaik ✦ | Creative Dot Art Studio",
   description: "An advanced, interactive browser-based studio for creating stunning dithered art, retro ASCII animations, and custom dot matrix graphics.",
   keywords: ["dithering", "dot art", "ascii", "retro", "graphics", "creative studio", "halftone", "generative art"],
